@@ -93,20 +93,19 @@ Resources:
           EnableAcceptEncodingGzip: false
           EnableAcceptEncodingBrotli: false
 
-  # Forward all viewer headers (except Host), cookies, and query strings to ALB
+   # Forward all viewer headers (including Host), cookies, and query strings to ALB
+   # Host header must be forwarded for Keycloak's KC_HOSTNAME_STRICT and KC_PROXY_HEADERS to work correctly
   ALBOriginRequestPolicy:
-    Type: AWS::CloudFront::OriginRequestPolicy
-    Properties:
-      OriginRequestPolicyConfig:
-        Name: !Sub ${ProjectName}-${Environment}-alb-origin
-        CookiesConfig:
-          CookieBehavior: all
-        HeadersConfig:
-          HeaderBehavior: allExcept
-          Headers:
-            - Host
-        QueryStringsConfig:
-          QueryStringBehavior: all
+     Type: AWS::CloudFront::OriginRequestPolicy
+     Properties:
+       OriginRequestPolicyConfig:
+         Name: !Sub ${ProjectName}-${Environment}-alb-origin
+         CookiesConfig:
+           CookieBehavior: all
+         HeadersConfig:
+           HeaderBehavior: all
+         QueryStringsConfig:
+           QueryStringBehavior: all
 
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution

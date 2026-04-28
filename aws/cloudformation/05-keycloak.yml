@@ -109,41 +109,43 @@ Resources:
               Protocol: tcp
               Name: management
           Environment:
-            - Name: KC_DB
-              Value: postgres
-            - Name: KC_DB_URL
-              Value: !Sub
-                - 'jdbc:postgresql://${Endpoint}:${Port}/keycloakapp'
-                - Endpoint:
-                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbEndpoint
-                  Port:
-                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbPort
-            - Name: KC_HEALTH_ENABLED
-              Value: 'true'
-            - Name: KC_METRICS_ENABLED
-              Value: 'true'
-            - Name: KC_HTTP_ENABLED
-              Value: 'true'
-            - Name: KC_HTTP_PORT
-              Value: '8080'
-            - Name: KC_HTTP_MANAGEMENT_PORT
-              Value: '9000'
-            - Name: KC_PROXY_HEADERS
-              Value: xforwarded
-            - Name: KC_HOSTNAME_STRICT
-              Value: 'false'
-            - Name: KC_HOSTNAME
-              Value: !If [HasFrontendHostname, !Ref FrontendHostname, !Sub '${FrontendUrl}']
-            - Name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
-              Value: 'true'
-            - Name: FRONTEND_URL
-              Value: !Ref FrontendUrl
-            - Name: KC_COOKIE_SAME_SITE
-              Value: 'Lax'
-            - Name: KC_COOKIE_SECURE
-              Value: 'true'
-            - Name: KC_COOKIE_HTTP_ONLY
-              Value: 'true'
+             - Name: KC_DB
+               Value: postgres
+             - Name: KC_DB_URL
+               Value: !Sub
+                 - 'jdbc:postgresql://${Endpoint}:${Port}/keycloakapp'
+                 - Endpoint:
+                     Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbEndpoint
+                   Port:
+                     Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbPort
+             - Name: KC_HEALTH_ENABLED
+               Value: 'true'
+             - Name: KC_METRICS_ENABLED
+               Value: 'true'
+             - Name: KC_HTTP_ENABLED
+               Value: 'true'
+             - Name: KC_HTTP_PORT
+               Value: '8080'
+             - Name: KC_HTTP_MANAGEMENT_PORT
+               Value: '9000'
+             - Name: KC_PROXY_HEADERS
+               Value: xforwarded
+             - Name: KC_HOSTNAME_STRICT
+               Value: 'true'
+             - Name: KC_HOSTNAME_STRICT_HTTPS
+               Value: 'true'
+             - Name: KC_HOSTNAME
+               Value: !If [HasFrontendHostname, !Ref FrontendHostname, !Select [1, !Split ['://', !Ref FrontendUrl]]]
+             - Name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+               Value: 'true'
+             - Name: FRONTEND_URL
+               Value: !Ref FrontendUrl
+             - Name: KC_COOKIE_SAME_SITE
+               Value: 'Lax'
+             - Name: KC_COOKIE_SECURE
+               Value: 'true'
+             - Name: KC_COOKIE_HTTP_ONLY
+               Value: 'true'
           Secrets:
             - Name: KC_DB_USERNAME
               ValueFrom: !Sub
