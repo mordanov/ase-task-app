@@ -1,0 +1,133 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kc_postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: kc_redis
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379:6379"
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: kc_dynamodb
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8001:8000"
+    networks:
+      - app_net
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.3
+    platform: linux/arm64
+    container_name: keycloak
+    command: start-dev --import-realm
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak_secret
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      AZURE_APPLICATION_ID: ${AZURE_APPLICATION_ID}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_PORT: 8080
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kc_backend
+    environment:
+      APP_ENV: local
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: app-realm
+      KEYCLOAK_CLIENT_ID: backend-client
+      KEYCLOAK_CLIENT_SECRET: backend-secret-key
+      CORS_ORIGINS: http://localhost:3001
+      # DynamoDB Local
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      DYNAMODB_SESSIONS_TABLE: keycloak-app-local-sessions
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "3030:8000"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - app_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_KEYCLOAK_URL: http://localhost:8080
+        VITE_KEYCLOAK_REALM: app-realm
+        VITE_KEYCLOAK_CLIENT_ID: frontend-client
+        VITE_API_URL: http://localhost:3030
+    container_name: kc_frontend
+    ports:
+      - "3001:3000"
+    depends_on:
+      - backend
+    networks:
+      - app_net
+
+volumes:
+  postgres_data:
+
+networks:
+  app_net:
+    driver: bridge

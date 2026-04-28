@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Serverless Spark cluster for on-demand calculations.
+  The application stays in STARTED state (no cost when idle).
+  Workers spin up on first job submission (~30s–2min) and stop after IdleTimeoutMinutes.
+  Data flows via S3: app writes input → Spark reads/processes → writes results to S3 → app reads.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  SparkRelease:
+    Type: String
+    Default: emr-7.1.0
+    Description: EMR release label (see https://docs.aws.amazon.com/emr/latest/ReleaseGuide/)
+  IdleTimeoutMinutes:
+    Type: Number
+    Default: 15
+    Description: Minutes of inactivity before workers are stopped (billing stops)
+  MaxCpu:
+    Type: String
+    Default: 40 vCPU
+  MaxMemory:
+    Type: String
+    Default: 120 GB
+  MaxDisk:
+    Type: String
+    Default: 200 GB
+
+Resources:
+  # ─── S3 bucket for job artifacts, input data, and results ────────────────────
+  SparkBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-spark-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-job-logs
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 30
+          - Id: expire-temp-data
+            Status: Enabled
+            Prefix: tmp/
+            ExpirationInDays: 7
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── IAM role assumed by Spark jobs (read/write S3, write logs) ───────────────
+  EmrExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-emr-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: emr-serverless.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SparkJobPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SparkBucket.Arn
+                  - !Sub ${SparkBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/emr-serverless/${ProjectName}-${Environment}*
+
+  # ─── EMR Serverless Application ───────────────────────────────────────────────
+  SparkApplication:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-spark
+      Type: SPARK
+      ReleaseLabel: !Ref SparkRelease
+      MaximumCapacity:
+        Cpu: !Ref MaxCpu
+        Memory: !Ref MaxMemory
+        Disk: !Ref MaxDisk
+      AutoStartConfiguration:
+        # Application auto-starts when a job is submitted — no manual start needed
+        Enabled: true
+      AutoStopConfiguration:
+        # Workers stop after being idle — cost goes to zero between jobs
+        Enabled: true
+        IdleTimeoutMinutes: !Ref IdleTimeoutMinutes
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  SparkApplicationId:
+    Value: !GetAtt SparkApplication.ApplicationId
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SparkApplicationId
+
+  SparkBucket:
+    Value: !Ref SparkBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SparkBucket
+
+  EmrExecutionRoleArn:
+    Value: !GetAtt EmrExecutionRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EmrExecutionRoleArn

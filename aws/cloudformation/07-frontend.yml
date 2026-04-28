@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 static hosting and CloudFront distribution for keycloak-app frontend
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  # Optional custom domain — leave empty to use the generated CloudFront domain
+  CustomDomain:
+    Type: String
+    Default: ''
+    Description: Custom domain (e.g. app.example.com). Leave empty to use CloudFront default.
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN in us-east-1 (required if CustomDomain is set)
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route53 Hosted Zone ID for CustomDomain (required if CustomDomain is set)
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomain, '']]
+
+Resources:
+  # ─── S3 Bucket ───────────────────────────────────────────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-frontend-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Origin Access Control — replaces legacy OAI
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${ProjectName}-${Environment}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ─── CloudFront ───────────────────────────────────────────────────────────────
+  CloudFrontCacheDisabled:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub ${ProjectName}-${Environment}-no-cache
+        DefaultTTL: 0
+        MaxTTL: 0
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+
+  # Forward all viewer headers (except Host), cookies, and query strings to ALB
+  ALBOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub ${ProjectName}-${Environment}-alb-origin
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allExcept
+          Headers:
+            - Host
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${ProjectName}-${Environment} distribution
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref CustomDomain]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          # S3 origin for frontend static assets
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref CloudFrontOAC
+
+          # ALB origin for API and Keycloak
+          - Id: ALBOrigin
+            DomainName:
+              Fn::ImportValue: !Sub ${ProjectName}-${Environment}-AlbDnsName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+            OriginCustomHeaders:
+              # ALB rejects requests without this header to block direct-access bypasses
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub
+                  - '{{resolve:secretsmanager:${SecretArn}:SecretString:value}}'
+                  - SecretArn:
+                      Fn::ImportValue: !Sub ${ProjectName}-${Environment}-OriginVerifySecretArn
+              # ALB only injects X-Forwarded-Proto when absent. Without this, ALB sets
+              # X-Forwarded-Proto:http (CloudFront→ALB is HTTP), Keycloak skips the
+              # Secure flag on cookies, and SameSite=None cookies are rejected by
+              # browsers — breaking social login flows (Google, GitHub, etc.).
+              - HeaderName: X-Forwarded-Proto
+                HeaderValue: https
+
+        # Default: serve SPA from S3 — cache with long TTL, invalidate on deploy
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized managed policy
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # SecurityHeadersPolicy
+
+        CacheBehaviors:
+          # Backend API — no caching, forward all headers + cookies
+          - PathPattern: /api/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CloudFrontCacheDisabled
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+
+          # Health endpoint (no cache)
+          - PathPattern: /health
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CloudFrontCacheDisabled
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+
+          # Keycloak OIDC endpoints — no caching (auth flows are stateful)
+          - PathPattern: /realms/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CloudFrontCacheDisabled
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+
+          # Keycloak theme resources — cacheable static files
+          - PathPattern: /resources/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+
+          # Keycloak JS adapter
+          - PathPattern: /js/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+
+          # Keycloak admin console — no caching, stateful session
+          - PathPattern: /admin/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref CloudFrontCacheDisabled
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+
+        # SPA routing: return index.html for all 403/404 from S3
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route53 A-record pointing the custom domain to CloudFront
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref CustomDomain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        # Z2FDTNDATAQYW2 is the fixed hosted zone ID for all CloudFront distributions
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  CloudFrontDistributionId:
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CloudFrontDistributionId
+
+  CloudFrontDomainName:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CloudFrontDomain
+
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-FrontendBucket
+
+  AppUrl:
+    Value: !If
+      - HasCustomDomain
+      - !Sub https://${CustomDomain}
+      - !Sub https://${CloudFrontDistribution.DomainName}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AppUrl

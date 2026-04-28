@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Keycloak ECS Fargate service with auto-scaling
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  KeycloakImageTag:
+    Type: String
+    Default: latest
+  FrontendUrl:
+    Type: String
+    Description: Public CloudFront URL (https://xxxxx.cloudfront.net or custom domain)
+  FrontendHostname:
+    Type: String
+    Default: ''
+    Description: Hostname only, extracted from FrontendUrl (e.g., aleksandr-mordanov.click)
+  KeycloakAdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Keycloak admin console password
+  BackendClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret for backend-client (must match KEYCLOAK_CLIENT_SECRET in backend)
+  GoogleClientId:
+    Type: String
+    Default: ''
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+  GithubClientId:
+    Type: String
+    Default: ''
+  GithubClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+  AzureApplicationId:
+    Type: String
+    Default: ''
+  AzureClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum number of Keycloak tasks (min 1 — Keycloak must always be reachable)
+  MaxCapacity:
+    Type: Number
+    Default: 3
+
+Conditions:
+  HasFrontendHostname: !Not [!Equals [!Ref FrontendHostname, '']]
+
+Resources:
+  # Keycloak secrets stored in Secrets Manager
+  KeycloakSecretsParam:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${ProjectName}/${Environment}/keycloak
+      Description: Keycloak runtime secrets
+      SecretString: !Sub |
+        {
+          "admin_password": "${KeycloakAdminPassword}",
+          "backend_client_secret": "${BackendClientSecret}",
+          "google_client_id": "${GoogleClientId}",
+          "google_client_secret": "${GoogleClientSecret}",
+          "github_client_id": "${GithubClientId}",
+          "github_client_secret": "${GithubClientSecret}",
+          "azure_application_id": "${AzureApplicationId}",
+          "azure_client_secret": "${AzureClientSecret}"
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  KeycloakTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-keycloak
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-TaskExecutionRoleArn
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-TaskRoleArn
+      ContainerDefinitions:
+        - Name: keycloak
+          Image: !Sub
+            - '${RepoUri}:${Tag}'
+            - RepoUri:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-KeycloakRepoUri
+              Tag: !Ref KeycloakImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+            - ContainerPort: 9000
+              Protocol: tcp
+              Name: management
+          Environment:
+            - Name: KC_DB
+              Value: postgres
+            - Name: KC_DB_URL
+              Value: !Sub
+                - 'jdbc:postgresql://${Endpoint}:${Port}/keycloakapp'
+                - Endpoint:
+                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbEndpoint
+                  Port:
+                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbPort
+            - Name: KC_HEALTH_ENABLED
+              Value: 'true'
+            - Name: KC_METRICS_ENABLED
+              Value: 'true'
+            - Name: KC_HTTP_ENABLED
+              Value: 'true'
+            - Name: KC_HTTP_PORT
+              Value: '8080'
+            - Name: KC_HTTP_MANAGEMENT_PORT
+              Value: '9000'
+            - Name: KC_PROXY_HEADERS
+              Value: xforwarded
+            - Name: KC_HOSTNAME_STRICT
+              Value: 'false'
+            - Name: KC_HOSTNAME
+              Value: !If [HasFrontendHostname, !Ref FrontendHostname, !Sub '${FrontendUrl}']
+            - Name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              Value: 'true'
+            - Name: FRONTEND_URL
+              Value: !Ref FrontendUrl
+            - Name: KC_COOKIE_SAME_SITE
+              Value: 'Lax'
+            - Name: KC_COOKIE_SECURE
+              Value: 'true'
+            - Name: KC_COOKIE_HTTP_ONLY
+              Value: 'true'
+          Secrets:
+            - Name: KC_DB_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn:
+                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbSecretArn
+            - Name: KC_DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbSecretArn
+            - Name: KEYCLOAK_ADMIN
+              ValueFrom: !Sub '${KeycloakSecretsParam}:admin_password::'
+            - Name: KEYCLOAK_ADMIN_PASSWORD
+              ValueFrom: !Sub '${KeycloakSecretsParam}:admin_password::'
+            - Name: KC_BACKEND_CLIENT_SECRET
+              ValueFrom: !Sub '${KeycloakSecretsParam}:backend_client_secret::'
+            - Name: GOOGLE_CLIENT_ID
+              ValueFrom: !Sub '${KeycloakSecretsParam}:google_client_id::'
+            - Name: GOOGLE_CLIENT_SECRET
+              ValueFrom: !Sub '${KeycloakSecretsParam}:google_client_secret::'
+            - Name: GITHUB_CLIENT_ID
+              ValueFrom: !Sub '${KeycloakSecretsParam}:github_client_id::'
+            - Name: GITHUB_CLIENT_SECRET
+              ValueFrom: !Sub '${KeycloakSecretsParam}:github_client_secret::'
+            - Name: AZURE_APPLICATION_ID
+              ValueFrom: !Sub '${KeycloakSecretsParam}:azure_application_id::'
+            - Name: AZURE_CLIENT_SECRET
+              ValueFrom: !Sub '${KeycloakSecretsParam}:azure_client_secret::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-KeycloakLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: keycloak
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -sf http://localhost:8080/health/ready || exit 1'
+            Interval: 60
+            Timeout: 30
+            Retries: 3
+            StartPeriod: 300
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  KeycloakService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-keycloak
+      Cluster:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ClusterArn
+      TaskDefinition: !Ref KeycloakTaskDefinition
+      DesiredCount: !Ref MinCapacity
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet1Id
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet2Id
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-EcsSgId
+      LoadBalancers:
+        - ContainerName: keycloak
+          ContainerPort: 8080
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-KeycloakTgArn
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 360
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── Auto Scaling ────────────────────────────────────────────────────────────
+  KeycloakScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub
+        - 'service/${Cluster}/${Service}'
+        - Cluster:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ClusterName
+          Service: !GetAtt KeycloakService.Name
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  KeycloakCpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-keycloak-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref KeycloakScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 65.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  KeycloakMemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-keycloak-memory-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref KeycloakScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+Outputs:
+  KeycloakServiceName:
+    Value: !GetAtt KeycloakService.Name
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KeycloakServiceName
+
+  KeycloakTaskDefinitionArn:
+    Value: !Ref KeycloakTaskDefinition
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KeycloakTaskDefArn

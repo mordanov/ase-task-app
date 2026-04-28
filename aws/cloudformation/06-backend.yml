@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FastAPI backend ECS Fargate service with auto-scaling from zero
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  BackendImageTag:
+    Type: String
+    Default: latest
+  FrontendUrl:
+    Type: String
+    Description: CloudFront URL used for CORS allowed origins
+  BackendClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Keycloak backend-client secret (same value as in 05-keycloak)
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Set to 0 to scale-to-zero when idle (first request adds ~30s cold-start)
+  MaxCapacity:
+    Type: Number
+    Default: 50
+
+Resources:
+  BackendAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${ProjectName}/${Environment}/backend
+      Description: Backend application secrets
+      SecretString: !Sub '{"keycloak_client_secret": "${BackendClientSecret}"}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-backend
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-TaskExecutionRoleArn
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-TaskRoleArn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub
+            - '${RepoUri}:${Tag}'
+            - RepoUri:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-BackendRepoUri
+              Tag: !Ref BackendImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: APP_ENV
+              Value: !Ref Environment
+            - Name: KEYCLOAK_URL
+              # JWKS endpoint goes through CloudFront so the X-Origin-Verify header
+              # is added automatically. Direct ALB access is blocked without it.
+              Value: !Ref FrontendUrl
+            - Name: KEYCLOAK_REALM
+              Value: app-realm
+            - Name: KEYCLOAK_CLIENT_ID
+              Value: backend-client
+            - Name: DB_HOST
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbEndpoint
+            - Name: DB_PORT
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbPort
+            - Name: DB_USER
+              Value: keycloakapp
+            - Name: DB_NAME
+              Value: keycloakapp
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DYNAMODB_SESSIONS_TABLE
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-SessionsTableName
+            - Name: CORS_ORIGINS
+              Value: !Ref FrontendUrl
+          Secrets:
+            - Name: KEYCLOAK_CLIENT_SECRET
+              ValueFrom: !Sub '${BackendAppSecret}:keycloak_client_secret::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn:
+                    Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -sf http://localhost:8000/health || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BackendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-backend
+      Cluster:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ClusterArn
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref MinCapacity
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet1Id
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet2Id
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-EcsSgId
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8000
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-BackendTgArn
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── Auto Scaling ────────────────────────────────────────────────────────────
+  BackendScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub
+        - 'service/${Cluster}/${Service}'
+        - Cluster:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ClusterName
+          Service: !GetAtt BackendService.Name
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  BackendCpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-backend-cpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref BackendScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60.0
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 30
+
+  BackendRequestScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-backend-requests
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref BackendScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub
+            - '${AlbSuffix}/targetgroup/${TgSuffix}'
+            - AlbSuffix:
+                Fn::Select:
+                  - 1
+                  - Fn::Split:
+                      - 'loadbalancer/'
+                      - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-AlbArn
+              TgSuffix:
+                Fn::Select:
+                  - 1
+                  - Fn::Split:
+                      - ':targetgroup/'
+                      - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-BackendTgArn
+        TargetValue: 1000
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 30
+
+Outputs:
+  BackendServiceName:
+    Value: !GetAtt BackendService.Name
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BackendServiceName
+
+  BackendTaskDefinitionArn:
+    Value: !Ref BackendTaskDefinition
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BackendTaskDefArn

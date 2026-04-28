@@ -1,0 +1,52 @@
+{
+  "nav": {
+    "profile": "Profile",
+    "userManagement": "User Management",
+    "signIn": "Sign in",
+    "register": "Register",
+    "signOut": "Sign out",
+    "adminConsole": "Admin Console"
+  },
+  "home": {
+    "poweredBy": "Powered by Keycloak",
+    "title": "Secure Auth Platform",
+    "subtitle": "Sign in with your Google account, Microsoft account, or create a local account using your email and password. All authentication is handled securely via Keycloak.",
+    "createAccount": "Create account",
+    "signedIn": "✓ You are signed in. Use the navigation above."
+  },
+  "auth": {
+    "loading": "Loading...",
+    "mustBeSignedIn": "You must be signed in to view this page.",
+    "accessDenied": "Access denied.",
+    "noRole": "You do not have the required {{role}} role."
+  },
+  "profile": {
+    "loading": "Loading profile...",
+    "authorised": "You are authorised",
+    "email": "Email",
+    "nickname": "Nickname",
+    "firstName": "First name",
+    "lastName": "Last name",
+    "roles": "Roles",
+    "lastLogin": "Last login",
+    "accountStatus": "Account status",
+    "active": "Active",
+    "disabled": "Disabled"
+  },
+  "admin": {
+    "title": "User management",
+    "subtitle": "View all registered users and control their access. Disabling a user blocks them from the API even if their Keycloak session is still valid.",
+    "loading": "Loading users...",
+    "noUsers": "No users have logged in yet.",
+    "cannotModifySelf": "Cannot modify self",
+    "enable": "Enable",
+    "disable": "Disable",
+    "colUser": "User",
+    "colEmail": "Email",
+    "colStatus": "Status",
+    "colAction": "Action",
+    "you": "you",
+    "active": "Active",
+    "disabled": "Disabled"
+  }
+}

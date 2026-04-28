@@ -1,0 +1,95 @@
+# ─── Environment / secrets ────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+credentials.config
+client_secret*
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.Python
+pip-wheel-metadata/
+
+# ─── Node / Frontend ──────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.local
+.npm
+*.tsbuildinfo
+
+# ─── Build artefacts ──────────────────────────────────────────────────────────
+dist/
+build/
+*.min.js.map
+*.chunk.js.map
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pip-log.txt
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+.docker/
+
+# ─── Keycloak ─────────────────────────────────────────────────────────────────
+# Local realm backup created by bootstrap.sh / docker builds
+keycloak/realm-export.json.local.bak
+keycloak/realm-export.json.bak
+
+# ─── AWS ──────────────────────────────────────────────────────────────────────
+# Quick-fix / one-off scripts that may contain env vars
+aws/scripts/quickfix.sh
+# SAM / CDK build artefacts (not used here, but safe to ignore)
+.aws-sam/
+cdk.out/
+
+# ─── IDE / editors ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+*.swp
+*.swo
+*~
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ─── Testing / coverage ───────────────────────────────────────────────────────
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.lcov
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.bak
+*.tmp
+*.orig
+.claude/

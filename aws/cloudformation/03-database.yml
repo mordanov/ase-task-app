@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Aurora Serverless v2 (user data) and DynamoDB (user sessions) for keycloak-app
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  AuroraMinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Minimum Aurora Serverless v2 capacity units (0.5 = minimum)
+  AuroraMaxCapacity:
+    Type: Number
+    Default: 1
+    Description: Maximum Aurora Serverless v2 capacity units
+
+Resources:
+  # ─── Secrets ──────────────────────────────────────────────────────────────────
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${ProjectName}/${Environment}/db-credentials
+      Description: Aurora PostgreSQL credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "keycloakapp"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Aurora Serverless v2 ─────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${ProjectName}-${Environment} Aurora subnet group
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet1Id
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-subnet-group
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub ${ProjectName}-${Environment}-aurora
+      Engine: aurora-postgresql
+      EngineVersion: '17.7'
+      DatabaseName: keycloakapp
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-AuroraSgId
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraMinCapacity
+        MaxCapacity: !Ref AuroraMaxCapacity
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      StorageEncrypted: true
+      DeletionProtection: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-aurora
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${Environment}-aurora-instance
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref DBCluster
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-aurora-instance
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DBSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref DBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  # ─── DynamoDB — user sessions ──────────────────────────────────────────────────
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Environment}-sessions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-sessions
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # Export names preserved for compatibility with 05-keycloak.yml and 06-backend.yml
+  DBEndpoint:
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DbEndpoint
+
+  DBPort:
+    Value: !GetAtt DBCluster.Endpoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DbPort
+
+  DBName:
+    Value: keycloakapp
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DbName
+
+  DBSecretArn:
+    Value: !Ref DBSecret
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DbSecretArn
+
+  SessionsTableName:
+    Value: !Ref SessionsTable
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SessionsTableName

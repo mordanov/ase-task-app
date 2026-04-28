@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM OIDC provider and role for GitHub Actions.
+  Run this stack ONCE — it's shared across environments.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or username (e.g. myorg)
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (e.g. keycloak-app)
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # GitHub OIDC provider — allows GitHub Actions to assume IAM roles without static credentials
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-github-actions
+      Description: Role assumed by GitHub Actions for deployments
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Restrict to main branch pushes and workflow_dispatch
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main
+      Policies:
+        - PolicyName: ECRPush
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                Resource:
+                  - !Sub arn:aws:ecr:*:${AWS::AccountId}:repository/${ProjectName}-*
+
+        - PolicyName: ECSDeployment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                  - ecs:DescribeClusters
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-task-*-role
+
+        - PolicyName: S3FrontendDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub arn:aws:s3:::${ProjectName}-*-frontend-*
+                  - !Sub arn:aws:s3:::${ProjectName}-*-frontend-*/*
+
+        - PolicyName: CloudFrontInvalidation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                  - cloudfront:GetDistribution
+                  - cloudfront:ListDistributions
+                Resource: '*'
+
+        - PolicyName: CloudFormationRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResource
+                Resource: '*'
+
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:*:${AWS::AccountId}:secret:/${ProjectName}/*
+
+Outputs:
+  GitHubActionsRoleArn:
+    Value: !GetAtt GitHubActionsRole.Arn
+    Description: Add this value as AWS_ROLE_ARN GitHub Actions secret
+    Export:
+      Name: !Sub ${ProjectName}-GitHubActionsRoleArn

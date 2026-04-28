@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECR repositories for backend and Keycloak images
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}/backend
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 20 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  KeycloakRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}/keycloak
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}/app
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 20 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  BackendRepositoryUri:
+    Value: !GetAtt BackendRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BackendRepoUri
+
+  KeycloakRepositoryUri:
+    Value: !GetAtt KeycloakRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KeycloakRepoUri
+
+  BackendRepositoryArn:
+    Value: !GetAtt BackendRepository.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BackendRepoArn
+
+  KeycloakRepositoryArn:
+    Value: !GetAtt KeycloakRepository.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KeycloakRepoArn
+
+  AppRepositoryUri:
+    Value: !GetAtt AppRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AppRepoUri

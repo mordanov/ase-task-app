@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ACM TLS certificate for a custom domain with automatic Route53 DNS validation.
+  MUST be deployed to us-east-1 regardless of the main deployment region
+  (CloudFront only accepts certificates from us-east-1).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  DomainName:
+    Type: String
+    Description: Custom domain (e.g. app.example.com or example.com)
+  HostedZoneId:
+    Type: String
+    Description: Route53 Hosted Zone ID that contains DomainName
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  CertificateArn:
+    Value: !Ref Certificate
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CertificateArn

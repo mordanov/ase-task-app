@@ -1,0 +1,404 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Cluster, ALB with path routing, IAM roles, and CloudWatch log groups
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # ─── ECS Cluster ────────────────────────────────────────────────────────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${Environment}
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── CloudWatch Log Groups ───────────────────────────────────────────────────
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/backend
+      RetentionInDays: 30
+
+  KeycloakLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/keycloak
+      RetentionInDays: 30
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/app
+      RetentionInDays: 30
+
+  # ─── IAM Roles ───────────────────────────────────────────────────────────────
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${ProjectName}/${Environment}/*
+
+  # Task role — permissions the application itself needs at runtime
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${ProjectName}/${Environment}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${Environment}-sessions
+              - Effect: Allow
+                Action:
+                  - emr-serverless:StartJobRun
+                  - emr-serverless:GetJobRun
+                  - emr-serverless:CancelJobRun
+                  - emr-serverless:ListJobRuns
+                Resource:
+                  - !Sub arn:aws:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ProjectName}-${Environment}-spark-*
+                  - !Sub arn:aws:s3:::${ProjectName}-${Environment}-spark-*/*
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-emr-execution-role
+
+  # ─── Application Load Balancer ───────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PublicSubnet1Id
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PublicSubnet2Id
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-AlbSgId
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Target Groups
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-backend
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${ProjectName}-${Environment}-VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  KeycloakTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-keycloak
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${ProjectName}-${Environment}-VpcId
+      HealthCheckPath: /health/ready
+      HealthCheckIntervalSeconds: 60
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-app
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${ProjectName}-${Environment}-VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Secret used by CloudFront to authenticate requests to ALB
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${ProjectName}/${Environment}/cloudfront-origin-secret
+      Description: X-Origin-Verify header value shared between CloudFront and ALB
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: value
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\ '
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ALB Listener: default action returns 403 (blocks direct ALB access without the header)
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Forbidden
+
+  # Routing rules — CloudFront must supply the X-Origin-Verify header
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/*
+              - /health
+              - /docs
+              - /openapi.json
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Sub
+                - '{{resolve:secretsmanager:${SecretArn}:SecretString:value}}'
+                - SecretArn: !Ref OriginVerifySecret
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # App catch-all rule — lowest priority, matches everything not caught by backend/keycloak
+  AppListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 30
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /*
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Sub
+                - '{{resolve:secretsmanager:${SecretArn}:SecretString:value}}'
+                - SecretArn: !Ref OriginVerifySecret
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  KeycloakListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /realms/*
+              - /resources/*
+              - /js/*
+              - /auth/*
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Sub
+                - '{{resolve:secretsmanager:${SecretArn}:SecretString:value}}'
+                - SecretArn: !Ref OriginVerifySecret
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref KeycloakTargetGroup
+
+Outputs:
+  ECSClusterName:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ClusterName
+
+  ECSClusterArn:
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ClusterArn
+
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-TaskExecutionRoleArn
+
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-TaskRoleArn
+
+  ALBArn:
+    Value: !Ref ALB
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbArn
+
+  ALBDnsName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbDnsName
+
+  ALBHostedZoneId:
+    Value: !GetAtt ALB.CanonicalHostedZoneID
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbHostedZoneId
+
+  BackendTargetGroupArn:
+    Value: !Ref BackendTargetGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BackendTgArn
+
+  KeycloakTargetGroupArn:
+    Value: !Ref KeycloakTargetGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KeycloakTgArn
+
+  BackendLogGroupName:
+    Value: !Ref BackendLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BackendLogGroup
+
+  KeycloakLogGroupName:
+    Value: !Ref KeycloakLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KeycloakLogGroup
+
+  OriginVerifySecretArn:
+    Value: !Ref OriginVerifySecret
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-OriginVerifySecretArn
+
+  AppTargetGroupArn:
+    Value: !Ref AppTargetGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AppTgArn
+
+  AppLogGroupName:
+    Value: !Ref AppLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AppLogGroup

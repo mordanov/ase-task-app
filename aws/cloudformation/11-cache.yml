@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ElastiCache Redis for application query caching
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: keycloak-app
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    AllowedValues:
+      - cache.t4g.micro    # 0.5 GB  ~$12/mo  — dev/staging
+      - cache.t4g.small    # 1.37 GB ~$24/mo
+      - cache.r7g.large    # 13.07 GB ~$140/mo — production
+    Description: Node type; use cache.t4g.micro for dev/staging
+  NumReplicaNodes:
+    Type: Number
+    Default: 0
+    Description: Replica nodes per shard (0 = single node, no HA; 1+ = Multi-AZ)
+
+Resources:
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub ${ProjectName}-${Environment} Redis subnet group
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet1Id
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-cache-subnet-group
+
+  CacheParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      Description: !Sub ${ProjectName}-${Environment} Redis 7 params
+      CacheParameterGroupFamily: redis7
+      Properties:
+        maxmemory-policy: allkeys-lru   # evict LRU keys when memory is full
+
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub ${ProjectName}-${Environment} Redis cache
+      ReplicationGroupId: !Sub ${ProjectName}-${Environment}
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: !Ref CacheNodeType
+      NumNodeGroups: 1
+      ReplicasPerNodeGroup: !Ref NumReplicaNodes
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      CacheParameterGroupName: !Ref CacheParameterGroup
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CacheSgId
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: required
+      AutomaticFailoverEnabled: !If
+        - HasReplicas
+        - true
+        - false
+      MultiAZEnabled: !If
+        - HasReplicas
+        - true
+        - false
+      SnapshotRetentionLimit: 1
+      SnapshotWindow: '03:00-04:00'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-redis
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Conditions:
+  HasReplicas: !Not [!Equals [!Ref NumReplicaNodes, 0]]
+
+Outputs:
+  CacheEndpoint:
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CacheEndpoint
+
+  CachePort:
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CachePort

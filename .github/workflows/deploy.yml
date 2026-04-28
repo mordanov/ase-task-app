@@ -1,0 +1,303 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: prod
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: keycloak-app
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'prod' }}
+
+permissions:
+  id-token: write   # required for OIDC token exchange
+  contents: read
+
+jobs:
+  # ─── Build & Push Backend ──────────────────────────────────────────────────
+  build-backend:
+    name: Build Backend Image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO="$ECR_REGISTRY/$PROJECT_NAME-$ENVIRONMENT/backend"
+          docker build \
+            -f backend/Dockerfile.prod \
+            -t "$REPO:$IMAGE_TAG" \
+            -t "$REPO:latest" \
+            ./backend
+          docker push "$REPO:$IMAGE_TAG"
+          docker push "$REPO:latest"
+          echo "image=$REPO:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  # ─── Build & Push Keycloak ─────────────────────────────────────────────────
+  build-keycloak:
+    name: Build Keycloak Image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Keycloak
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO="$ECR_REGISTRY/$PROJECT_NAME-$ENVIRONMENT/keycloak"
+
+          # Use the production realm template (placeholders replaced at runtime via entrypoint)
+          cp keycloak/realm-export.json keycloak/realm-export.json.bak
+          cp keycloak/realm-export-template.json keycloak/realm-export.json
+
+          docker build \
+            -f keycloak/Dockerfile \
+            -t "$REPO:$IMAGE_TAG" \
+            -t "$REPO:latest" \
+            ./keycloak
+
+          # Restore original dev realm
+          mv keycloak/realm-export.json.bak keycloak/realm-export.json
+
+          docker push "$REPO:$IMAGE_TAG"
+          docker push "$REPO:latest"
+          echo "image=$REPO:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  # ─── Deploy Frontend to S3 + CloudFront ───────────────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get frontend outputs from CloudFormation
+        id: cfn
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-frontend" \
+            --query 'Stacks[0].Outputs[?OutputKey==`AppUrl`].OutputValue' \
+            --output text)
+
+          FRONTEND_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-frontend" \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucketName`].OutputValue' \
+            --output text)
+
+          DISTRIBUTION_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-frontend" \
+            --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontDistributionId`].OutputValue' \
+            --output text)
+
+          echo "app_url=$APP_URL" >> "$GITHUB_OUTPUT"
+          echo "frontend_bucket=$FRONTEND_BUCKET"     >> "$GITHUB_OUTPUT"
+          echo "distribution_id=$DISTRIBUTION_ID"    >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_KEYCLOAK_URL: ${{ steps.cfn.outputs.app_url }}
+          VITE_KEYCLOAK_REALM: app-realm
+          VITE_KEYCLOAK_CLIENT_ID: frontend-client
+          VITE_API_URL: ${{ steps.cfn.outputs.app_url }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload to S3
+        run: |
+          # Long-cache for hashed assets, no-cache for index.html
+          aws s3 sync frontend/dist \
+            s3://${{ steps.cfn.outputs.frontend_bucket }} \
+            --delete \
+            --exclude "index.html" \
+            --cache-control "public,max-age=31536000,immutable"
+
+          aws s3 cp frontend/dist/index.html \
+            s3://${{ steps.cfn.outputs.frontend_bucket }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.cfn.outputs.distribution_id }} \
+            --paths "/*"
+
+  # ─── Deploy Backend ECS Service ───────────────────────────────────────────
+  deploy-backend:
+    name: Deploy Backend to ECS
+    runs-on: ubuntu-latest
+    needs: build-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ECS names from CloudFormation
+        id: cfn
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-cluster" \
+            --query 'Stacks[0].Outputs[?OutputKey==`ECSClusterName`].OutputValue' \
+            --output text)
+          SERVICE=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-backend" \
+            --query 'Stacks[0].Outputs[?OutputKey==`BackendServiceName`].OutputValue' \
+            --output text)
+          echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service with new image
+        env:
+          IMAGE: ${{ needs.build-backend.outputs.image }}
+          CLUSTER: ${{ steps.cfn.outputs.cluster }}
+          SERVICE: ${{ steps.cfn.outputs.service }}
+        run: |
+          TASK_FAMILY="$PROJECT_NAME-$ENVIRONMENT-backend"
+
+          # Get current task definition and replace image
+          CURRENT_TASK=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK=$(echo "$CURRENT_TASK" | jq \
+            --arg IMAGE "$IMAGE" \
+            'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .placementConstraints, .compatibilities,
+                  .registeredAt, .registeredBy)
+             | .containerDefinitions[0].image = $IMAGE')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$NEW_ARN"
+
+          echo "Waiting for backend service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+          echo "Backend deployment complete."
+
+  # ─── Deploy Keycloak ECS Service ──────────────────────────────────────────
+  deploy-keycloak:
+    name: Deploy Keycloak to ECS
+    runs-on: ubuntu-latest
+    needs: build-keycloak
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ECS names from CloudFormation
+        id: cfn
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-cluster" \
+            --query 'Stacks[0].Outputs[?OutputKey==`ECSClusterName`].OutputValue' \
+            --output text)
+          SERVICE=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-keycloak" \
+            --query 'Stacks[0].Outputs[?OutputKey==`KeycloakServiceName`].OutputValue' \
+            --output text)
+          echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+
+      - name: Update Keycloak ECS service with new image
+        env:
+          IMAGE: ${{ needs.build-keycloak.outputs.image }}
+          CLUSTER: ${{ steps.cfn.outputs.cluster }}
+          SERVICE: ${{ steps.cfn.outputs.service }}
+        run: |
+          TASK_FAMILY="$PROJECT_NAME-$ENVIRONMENT-keycloak"
+
+          CURRENT_TASK=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK=$(echo "$CURRENT_TASK" | jq \
+            --arg IMAGE "$IMAGE" \
+            'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .placementConstraints, .compatibilities,
+                  .registeredAt, .registeredBy)
+             | .containerDefinitions[0].image = $IMAGE')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$NEW_ARN"
+
+          echo "Waiting for Keycloak service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+          echo "Keycloak deployment complete."
