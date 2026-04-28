@@ -158,7 +158,7 @@ Resources:
                 - SecretArn:
                     Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DbSecretArn
             - Name: KEYCLOAK_ADMIN
-              ValueFrom: !Sub '${KeycloakSecretsParam}:admin_password::'
+              Value: admin
             - Name: KEYCLOAK_ADMIN_PASSWORD
               ValueFrom: !Sub '${KeycloakSecretsParam}:admin_password::'
             - Name: KC_BACKEND_CLIENT_SECRET
