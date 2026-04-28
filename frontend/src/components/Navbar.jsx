@@ -76,7 +76,7 @@ const styles = {
 };
 
 export default function Navbar() {
-  const { isAuthenticated, isAdmin, login, register, logout, keycloak } = useAuth();
+  const { isAuthenticated, isAdmin, login, register, logout } = useAuth();
   const location = useLocation();
   const { t, i18n } = useTranslation();
 
@@ -98,7 +98,7 @@ export default function Navbar() {
             )}
             {isAdmin() && (
               <a
-                href={`${(keycloak.authServerUrl || "").replace(/\/$/, "")}/admin/`}
+                href="/admin/"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={styles.link}
