@@ -32,7 +32,11 @@ jobs:
   deploy-infra:
     name: Deploy Infra (CloudFormation)
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.deploy_infra == 'true' }}
+    if: >-
+      ${{ github.event.inputs.deploy_infra == 'true' ||
+          (github.event_name == 'push' &&
+           (contains(toJson(github.event.commits.*.modified), 'aws/cloudformation/') ||
+            contains(toJson(github.event.commits.*.added), 'aws/cloudformation/'))) }}
     steps:
       - uses: actions/checkout@v4
 
