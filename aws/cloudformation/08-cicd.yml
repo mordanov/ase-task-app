@@ -89,7 +89,7 @@ Resources:
                 Action:
                   - iam:PassRole
                 Resource:
-                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-task-*-role
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-task-role
                   - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-task-execution-role
 
         # ── S3 frontend assets ────────────────────────────────────────────────
