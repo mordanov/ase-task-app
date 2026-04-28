@@ -103,7 +103,7 @@ Resources:
          CookiesConfig:
            CookieBehavior: all
          HeadersConfig:
-           HeaderBehavior: all
+           HeaderBehavior: allViewer
          QueryStringsConfig:
            QueryStringBehavior: all
 
