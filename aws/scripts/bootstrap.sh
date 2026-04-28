@@ -2,16 +2,27 @@
 # Bootstrap script — deploys all CloudFormation stacks in dependency order
 # and pushes initial Docker images to ECR.
 #
-# Usage: AWS_REGION=us-east-1 PROJECT_NAME=keycloak-app ENVIRONMENT=prod \
-#          AWS_PROFILE=my-profile \
-#          DOMAIN_NAME=app.example.com \
-#          KEYCLOAK_ADMIN_PASSWORD=secret BACKEND_CLIENT_SECRET=secret \
-#          bash aws/scripts/bootstrap.sh
+# Usage:
+#   AWS_REGION=us-east-1 \
+#   PROJECT_NAME=keycloak-app \
+#   ENVIRONMENT=prod \
+#   AWS_PROFILE=my-profile \
+#   DOMAIN_NAME=app.example.com \
+#   KEYCLOAK_ADMIN_PASSWORD=secret \
+#   BACKEND_CLIENT_SECRET=secret \
+#   GITHUB_ORG=my-org \
+#   GITHUB_REPO=keycloak-app \
+#     bash aws/scripts/bootstrap.sh
+#
+# Optional OAuth env vars (for social login):
+#   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+#   GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
+#   AZURE_APPLICATION_ID, AZURE_CLIENT_SECRET
 #
 # Prerequisites:
 #   - AWS CLI v2 configured (aws configure or environment credentials)
 #   - Docker running locally
-#   - jq installed
+#   - jq, npm installed
 
 set -euo pipefail
 
@@ -21,6 +32,8 @@ ENVIRONMENT="${ENVIRONMENT:-prod}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-}"
 DOMAIN_NAME="${DOMAIN_NAME:-}"
+GITHUB_ORG="${GITHUB_ORG:-}"
+GITHUB_REPO="${GITHUB_REPO:-}"
 CFN_DIR="$(dirname "$0")/../cloudformation"
 
 STACK_PREFIX="${PROJECT_NAME}-${ENVIRONMENT}"
@@ -259,7 +272,8 @@ deploy_stack "${STACK_PREFIX}-app" "${CFN_DIR}/09-app.yml" \
     Environment="$ENVIRONMENT"
 
 # ─── 12. CI/CD IAM (run once, not environment-specific) ────────────────────────
-if [[ -n "${GITHUB_ORG:-}" && -n "${GITHUB_REPO:-}" ]]; then
+GITHUB_ROLE=""
+if [[ -n "$GITHUB_ORG" && -n "$GITHUB_REPO" ]]; then
   deploy_stack "${PROJECT_NAME}-cicd" "${CFN_DIR}/08-cicd.yml" \
     --parameter-overrides \
       ProjectName="$PROJECT_NAME" \
@@ -278,9 +292,18 @@ ok "Bootstrap complete!"
 echo ""
 echo "  App URL:          $APP_URL"
 echo "  Keycloak admin:   $APP_URL/realms/app-realm (use Keycloak admin console for realm management)"
+if [[ -n "$GITHUB_ROLE" ]]; then
+echo ""
+echo "  GitHub Actions IAM role ARN (add as AWS_ROLE_ARN secret in your repo):"
+echo "    $GITHUB_ROLE"
+fi
 echo ""
 echo "Next steps:"
-echo "  1. Add AWS_ROLE_ARN secret to GitHub repo"
-echo "  2. Add AWS_REGION variable to GitHub repo (value: $AWS_REGION)"
-echo "  3. Update OAuth provider redirect URIs at the providers' consoles to allow: $APP_URL"
+if [[ -n "$GITHUB_ROLE" ]]; then
+echo "  1. Add secret  AWS_ROLE_ARN  = $GITHUB_ROLE  to GitHub repo"
+else
+echo "  1. Run bootstrap again with GITHUB_ORG and GITHUB_REPO to create the CI/CD role"
+fi
+echo "  2. Add variable AWS_REGION   = $AWS_REGION   to GitHub repo"
+echo "  3. Update OAuth provider redirect URIs at providers' consoles to allow: $APP_URL"
 echo "  4. Push to main branch to trigger the GitHub Actions deployment pipeline"

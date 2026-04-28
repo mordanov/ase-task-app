@@ -13,10 +13,6 @@ Parameters:
   GitHubRepo:
     Type: String
     Description: GitHub repository name (e.g. keycloak-app)
-  Environment:
-    Type: String
-    Default: prod
-    AllowedValues: [dev, staging, prod]
 
 Resources:
   # GitHub OIDC provider — allows GitHub Actions to assume IAM roles without static credentials
@@ -46,9 +42,11 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                # Restrict to main branch pushes and workflow_dispatch
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main
+                # Allow push to main AND workflow_dispatch from any branch
+                # (so "dev" environment deploys via manual trigger work too)
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/*
       Policies:
+        # ── ECR ──────────────────────────────────────────────────────────────
         - PolicyName: ECRPush
           PolicyDocument:
             Version: '2012-10-17'
@@ -71,6 +69,7 @@ Resources:
                 Resource:
                   - !Sub arn:aws:ecr:*:${AWS::AccountId}:repository/${ProjectName}-*
 
+        # ── ECS service deployments ───────────────────────────────────────────
         - PolicyName: ECSDeployment
           PolicyDocument:
             Version: '2012-10-17'
@@ -80,6 +79,7 @@ Resources:
                   - ecs:DescribeServices
                   - ecs:DescribeTaskDefinition
                   - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
                   - ecs:UpdateService
                   - ecs:DescribeClusters
                   - ecs:ListTasks
@@ -90,7 +90,9 @@ Resources:
                   - iam:PassRole
                 Resource:
                   - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-task-*-role
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*-task-execution-role
 
+        # ── S3 frontend assets ────────────────────────────────────────────────
         - PolicyName: S3FrontendDeploy
           PolicyDocument:
             Version: '2012-10-17'
@@ -102,11 +104,19 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                   - s3:GetBucketLocation
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:CreateBucket
+                  - s3:PutBucketTagging
                 Resource:
                   - !Sub arn:aws:s3:::${ProjectName}-*-frontend-*
                   - !Sub arn:aws:s3:::${ProjectName}-*-frontend-*/*
 
-        - PolicyName: CloudFrontInvalidation
+        # ── CloudFront distribution + cache invalidation ──────────────────────
+        - PolicyName: CloudFrontManagement
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -115,28 +125,113 @@ Resources:
                   - cloudfront:CreateInvalidation
                   - cloudfront:GetInvalidation
                   - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
                   - cloudfront:ListDistributions
+                  - cloudfront:CreateDistribution
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:TagResource
+                  - cloudfront:CreateOriginAccessControl
+                  - cloudfront:UpdateOriginAccessControl
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:CreateCachePolicy
+                  - cloudfront:UpdateCachePolicy
+                  - cloudfront:GetCachePolicy
+                  - cloudfront:DeleteCachePolicy
+                  - cloudfront:CreateOriginRequestPolicy
+                  - cloudfront:UpdateOriginRequestPolicy
+                  - cloudfront:GetOriginRequestPolicy
+                  - cloudfront:DeleteOriginRequestPolicy
                 Resource: '*'
 
-        - PolicyName: CloudFormationRead
+        # ── Route53 (DNS alias for custom domain) ─────────────────────────────
+        - PolicyName: Route53RecordManagement
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - cloudformation:DescribeStacks
-                  - cloudformation:DescribeStackResource
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHostedZone
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                  - route53:GetChange
                 Resource: '*'
 
-        - PolicyName: SecretsManagerRead
+        # ── Secrets Manager (Keycloak secrets + OriginVerifySecret) ──────────
+        - PolicyName: SecretsManagerManagement
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:GetRandomPassword
                 Resource:
                   - !Sub arn:aws:secretsmanager:*:${AWS::AccountId}:secret:/${ProjectName}/*
+
+        # ── Application Auto Scaling (Keycloak ECS scaling policies) ─────────
+        - PolicyName: AutoScalingManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:DeregisterScalableTarget
+                  - application-autoscaling:PutScalingPolicy
+                  - application-autoscaling:DeleteScalingPolicy
+                  - application-autoscaling:DescribeScalableTargets
+                  - application-autoscaling:DescribeScalingPolicies
+                Resource: '*'
+
+        # ── CloudFormation — read (all jobs) + deploy (deploy-infra job) ──────
+        - PolicyName: CloudFormationManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read access — needed by every job to fetch stack outputs
+              - Sid: CloudFormationRead
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStackResources
+                Resource: '*'
+              # Deploy access — needed by deploy-infra job only (scoped to this project's stacks)
+              - Sid: CloudFormationDeploy
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                Resource:
+                  - !Sub arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*
+
+        # ── ACM — read certificate ARN for CloudFormation parameters ─────────
+        - PolicyName: ACMRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:DescribeCertificate
+                  - acm:ListCertificates
+                  - acm:GetCertificate
+                Resource: '*'
 
 Outputs:
   GitHubActionsRoleArn:

@@ -11,17 +11,120 @@ on:
         default: prod
         type: choice
         options: [dev, staging, prod]
+      deploy_infra:
+        description: 'Apply CloudFormation infra updates (07-frontend, 05-keycloak)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
   PROJECT_NAME: keycloak-app
-  ENVIRONMENT: ${{ github.event.inputs.environment || 'prod' }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
 
 permissions:
   id-token: write   # required for OIDC token exchange
   contents: read
 
 jobs:
+  # ─── (Optional) Update CloudFormation stacks ───────────────────────────────
+  deploy-infra:
+    name: Deploy Infra (CloudFormation)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.deploy_infra == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Read existing stack params so the operator doesn't need to re-supply them ──
+      - name: Read existing infra parameters
+        id: params
+        run: |
+          FRONTEND_STACK="$PROJECT_NAME-$ENVIRONMENT-frontend"
+          KEYCLOAK_STACK="$PROJECT_NAME-$ENVIRONMENT-keycloak"
+          CERT_STACK="$PROJECT_NAME-$ENVIRONMENT-certificate"
+
+          DOMAIN_NAME=$(aws cloudformation describe-stacks \
+            --stack-name "$FRONTEND_STACK" --region "$AWS_REGION" \
+            --query "Stacks[0].Parameters[?ParameterKey=='CustomDomain'].ParameterValue" \
+            --output text)
+
+          HOSTED_ZONE_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$FRONTEND_STACK" --region "$AWS_REGION" \
+            --query "Stacks[0].Parameters[?ParameterKey=='HostedZoneId'].ParameterValue" \
+            --output text)
+
+          CERT_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$CERT_STACK" --region us-east-1 \
+            --query "Stacks[0].Outputs[?OutputKey=='CertificateArn'].OutputValue" \
+            --output text)
+
+          FRONTEND_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$FRONTEND_STACK" --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" \
+            --output text)
+          FRONTEND_HOSTNAME=$(echo "$FRONTEND_URL" | sed -E 's|https?://||')
+
+          echo "domain_name=$DOMAIN_NAME"       >> "$GITHUB_OUTPUT"
+          echo "hosted_zone_id=$HOSTED_ZONE_ID" >> "$GITHUB_OUTPUT"
+          echo "cert_arn=$CERT_ARN"             >> "$GITHUB_OUTPUT"
+          echo "frontend_url=$FRONTEND_URL"     >> "$GITHUB_OUTPUT"
+          echo "frontend_hostname=$FRONTEND_HOSTNAME" >> "$GITHUB_OUTPUT"
+
+      # ── 07-frontend.yml ──────────────────────────────────────────────────────
+      - name: Deploy frontend CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-frontend" \
+            --template-file aws/cloudformation/07-frontend.yml \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION" \
+            --parameter-overrides \
+              ProjectName="$PROJECT_NAME" \
+              Environment="$ENVIRONMENT" \
+              CustomDomain="${{ steps.params.outputs.domain_name }}" \
+              AcmCertificateArn="${{ steps.params.outputs.cert_arn }}" \
+              HostedZoneId="${{ steps.params.outputs.hosted_zone_id }}"
+
+      # ── 05-keycloak.yml ──────────────────────────────────────────────────────
+      - name: Deploy Keycloak CloudFormation stack
+        env:
+          KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
+          BACKEND_CLIENT_SECRET:   ${{ secrets.BACKEND_CLIENT_SECRET }}
+          GOOGLE_CLIENT_ID:        ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:    ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GITHUB_CLIENT_ID:        ${{ secrets.OAUTH_GITHUB_CLIENT_ID }}
+          GITHUB_CLIENT_SECRET:    ${{ secrets.OAUTH_GITHUB_CLIENT_SECRET }}
+          AZURE_APPLICATION_ID:    ${{ secrets.AZURE_APPLICATION_ID }}
+          AZURE_CLIENT_SECRET:     ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$PROJECT_NAME-$ENVIRONMENT-keycloak" \
+            --template-file aws/cloudformation/05-keycloak.yml \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION" \
+            --parameter-overrides \
+              ProjectName="$PROJECT_NAME" \
+              Environment="$ENVIRONMENT" \
+              FrontendUrl="${{ steps.params.outputs.frontend_url }}" \
+              FrontendHostname="${{ steps.params.outputs.frontend_hostname }}" \
+              KeycloakAdminPassword="$KEYCLOAK_ADMIN_PASSWORD" \
+              BackendClientSecret="$BACKEND_CLIENT_SECRET" \
+              GoogleClientId="$GOOGLE_CLIENT_ID" \
+              GoogleClientSecret="$GOOGLE_CLIENT_SECRET" \
+              GithubClientId="$GITHUB_CLIENT_ID" \
+              GithubClientSecret="$GITHUB_CLIENT_SECRET" \
+              AzureApplicationId="$AZURE_APPLICATION_ID" \
+              AzureClientSecret="$AZURE_CLIENT_SECRET"
+
   # ─── Build & Push Backend ──────────────────────────────────────────────────
   build-backend:
     name: Build Backend Image
@@ -105,6 +208,9 @@ jobs:
   deploy-frontend:
     name: Deploy Frontend
     runs-on: ubuntu-latest
+    # Wait for infra update when it is requested; skip the wait otherwise
+    needs: [deploy-infra]
+    if: ${{ always() && !failure() && !cancelled() }}
     steps:
       - uses: actions/checkout@v4
 
