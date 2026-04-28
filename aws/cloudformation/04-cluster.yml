@@ -332,6 +332,27 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref KeycloakTargetGroup
 
+  KeycloakAdminListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 21
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /admin/*
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Sub
+                - '{{resolve:secretsmanager:${SecretArn}:SecretString:value}}'
+                - SecretArn: !Ref OriginVerifySecret
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref KeycloakTargetGroup
+
 Outputs:
   ECSClusterName:
     Value: !Ref ECSCluster
